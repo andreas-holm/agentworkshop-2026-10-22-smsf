@@ -228,6 +228,22 @@ await t('MO: every forced scenario answers what /test says (fast ones)', async (
   assert.equal(unknown.status, 400);
 });
 
+await t('MO rejections count the RP-Cause the UE should get per TS 23.040 11.3', async () => {
+  const want = {
+    UNKNOWN_SERVICE_CENTRE: '1 UNASSIGNED_UNALLOCATED_NUMBER', INVALID_SME_ADDRESS: '21 SHORT_MESSAGE_TRANSFER_REJECTED',
+    DUPLICATE: '21 SHORT_MESSAGE_TRANSFER_REJECTED', SC_CONGESTION: '42 CONGESTION', USER_NOT_SC_USER: '28 UNIDENTIFIED_SUBSCRIBER',
+    DESTINATION_BARRED: '28 UNIDENTIFIED_SUBSCRIBER', SYSTEM_FAILURE: '42 CONGESTION',
+    FACILITY_NOT_SUPPORTED: '69 REQUESTED_FACILITY_NOT_IMPLEMENTED', SERVER_ERROR: '38 NETWORK_OUT_OF_ORDER', NOPE: '38 NETWORK_OUT_OF_ORDER',
+  };
+  for (const [s, cause] of Object.entries(want)) {
+    const before = (await j('GET', '/api/metrics')).body.rpCauses.out;
+    await j('POST', `/smsc/mo-forward-short-message?dryRun=1&scenario=${s.toLowerCase()}`, moBody());
+    const after = (await j('GET', '/api/metrics')).body.rpCauses.out;
+    const moved = Object.keys(after).filter(k => after[k] !== before[k]);
+    assert.deepEqual(moved, [cause], `${s} -> ${cause}`);
+  }
+});
+
 // ---------- test endpoints ----------
 await t('GET /test lists endpoints, and every MO example in it actually works (dry run)', async () => {
   const c = (await j('GET', '/test')).body;
@@ -440,6 +456,33 @@ await t('MT: UE answers RP-ERROR memory capacity exceeded -> MEMORY_CAPACITY_EXC
   const r = await j('POST', '/api/mt?wait=1', { to: '46700000118', text: 'x' });
   assert.equal(r.body.result, 'WAITING');
   assert.equal((await waitFor(() => callsFor('46700000118', 'report-sm-delivery-status')[0])).body.deliveryOutcome, 'MEMORY_CAPACITY_EXCEEDED');
+});
+await t('MT: SMSF answer in SGd form (bare SMS-DELIVER-REPORT TPDU, RP-Cause in body.rpCause) is understood and counted', async () => {
+  const pd = async () => (await j('GET', '/api/metrics')).body;
+  const before = await pd();
+  // 200 + bare TPDU "0000" is what the live SMSF sends for an RP-ACK.
+  smsfRules['46700000461'] = [200, { result: 'SUCCESS', deliveryReport: { hex: '0000' } }];
+  assert.equal((await j('POST', '/api/mt?wait=1', { to: '46700000461', text: 'x' })).body.result, 'DELIVERED');
+  // 502 + rpCause 22 + bare TPDU with TP-FCS: memory full must wait for the alert, not fail.
+  smsfRules['46700000462'] = [502, { result: 'FAILURE', cause: 'UE answered RP-ERROR', rpCause: 22, deliveryReport: { hex: '00D300' } }];
+  assert.equal((await j('POST', '/api/mt?wait=1', { to: '46700000462', text: 'x' })).body.result, 'WAITING');
+  assert.equal((await waitFor(() => callsFor('46700000462', 'report-sm-delivery-status')[0])).body.deliveryOutcome, 'MEMORY_CAPACITY_EXCEEDED');
+  // 502 + rpCause 41 and no report at all: temporary, backoff.
+  smsfRules['46700000463'] = [502, { result: 'FAILURE', cause: 'UE answered RP-ERROR', rpCause: 41 }];
+  const r3 = await j('POST', '/api/mt?wait=1', { to: '46700000463', text: 'x' });
+  assert.equal(r3.body.result, 'WAITING');
+  assert.match((await msg(r3.body.messageId)).history.at(-1).detail, /cause 41 \(temporary\)/);
+  // 502 + rpCause 21 + bare TPDU: permanent.
+  smsfRules['46700000464'] = [502, { result: 'FAILURE', rpCause: 21, deliveryReport: { hex: '00C000' } }];
+  assert.equal((await j('POST', '/api/mt?wait=1', { to: '46700000464', text: 'x' })).body.result, 'FAILED');
+  for (const n of ['46700000461', '46700000462', '46700000463', '46700000464']) delete smsfRules[n];
+  const after = await pd();
+  const d = (sec, k) => after.pdus[sec][k] - before.pdus[sec][k];
+  assert.equal(d('in', 'RP-ACK/SMS-DELIVER-REPORT'), 1);
+  assert.equal(d('in', 'RP-ERROR/SMS-DELIVER-REPORT'), 3);
+  assert.equal(d('in', 'none/no-report'), 0);
+  const dc = k => after.rpCauses.in[k] - before.rpCauses.in[k];
+  assert.deepEqual([dc('22 MEMORY_CAPACITY_EXCEEDED'), dc('41 TEMPORARY_FAILURE'), dc('21 SHORT_MESSAGE_TRANSFER_REJECTED')], [1, 1, 1]);
 });
 await t('MT: other RP-ERROR -> FAILED; unknown, barred and not provisioned subscribers -> FAILED', async () => {
   smsfRules['46700000119'] = [502, { result: 'FAILURE', deliveryReport: { hex: '04050115' } }]; // cause 21: permanent
@@ -1154,7 +1197,7 @@ await t('metrics: MO counted as mo_received/mo_accepted/mo_forwarded; mt_origina
       assert.deepEqual(m.pdus.in, { 'RP-DATA/SMS-SUBMIT': 2, 'RP-ACK/SMS-DELIVER-REPORT': 1, 'RP-ACK/STATUS-REPORT-ACK': 1, 'RP-ERROR/SMS-DELIVER-REPORT': 1, 'none/no-report': 1 });
       assert.deepEqual(m.pdus.out, { 'RP-ACK/SMS-SUBMIT-REPORT': 1, 'RP-ERROR/SMS-SUBMIT-REPORT': 1, 'RP-DATA/SMS-DELIVER': 3, 'RP-DATA/SMS-STATUS-REPORT': 1 });
       assert.deepEqual(Object.entries(m.rpCauses.in).filter(([, v]) => v), [['22 MEMORY_CAPACITY_EXCEEDED', 1]]);
-      assert.deepEqual(Object.entries(m.rpCauses.out).filter(([, v]) => v), [['21 SHORT_MESSAGE_TRANSFER_REJECTED', 1]]);
+      assert.deepEqual(Object.entries(m.rpCauses.out).filter(([, v]) => v), [['1 UNASSIGNED_UNALLOCATED_NUMBER', 1]]);
       const { byTpSt, ...sr } = m.statusReports;
       assert.deepEqual(sr, { generated: 1, sent: 1, delivered: 1, failed: 0, expired: 0, waiting: 0 });
       assert.deepEqual(Object.entries(byTpSt).filter(([, v]) => v), [['0x00', 1]]);
