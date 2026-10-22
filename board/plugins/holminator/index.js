@@ -322,7 +322,12 @@ const MO_SCENARIOS = {
 // RP-Cause it would carry for a rejection (TS 24.011 8.2.5.4), by our Diameter result: 5004 -> 95 semantically incorrect,
 // 5005 -> 96 invalid mandatory information, 5552 -> 69 facility not implemented, 5012 -> 38 network out of order,
 // 5555 -> 42 congestion for SC_CONGESTION, else 21 short message transfer rejected.
-const MO_RP_CAUSE = { 5004: 95, 5005: 96, 5552: 69, 5012: 38 };
+// RP-Cause the UE should get for our OFA error, per TS 23.040 11.3 (MAP MO-ForwardSM error -> RP-Cause).
+// Unexpected data value and system failure map to 38; equipmentProtocolError has no row, so we use 21.
+const MO_RP_CAUSE = { 5004: 38, 5005: 38, 5552: 69, 5012: 38 };
+const MO_SM_FAILURE_RP_CAUSE = {
+  UNKNOWN_SERVICE_CENTRE: 1, SC_CONGESTION: 42, INVALID_SME_ADDRESS: 21, USER_NOT_SC_USER: 28, EQUIPMENT_PROTOCOL_ERROR: 21,
+};
 function moRejected(cause) {
   inc('mo_rejected');
   pdu('out', 'RP-ERROR/SMS-SUBMIT-REPORT');
@@ -351,8 +356,8 @@ async function moForward(req, res, url) {
     return reply(res, 'smsf', what, 400, { result: 'UNEXPECTED_DATA_VALUE', diameterResultCode: 5004, detail: 'body is not JSON' });
   }
   inbound('smsf', `POST /smsc/mo-forward-short-message${scenarioName ? ` [scenario ${scenarioName}]` : ''}${dryRun ? ' [dry run]' : ''}`, b);
-  const bad = (status, body) => { moRejected(MO_RP_CAUSE[body.diameterResultCode] || 111); return reply(res, 'smsf', what, status, body); };
-  const fail = (cause, fcs, detail) => { moRejected(cause === 'SC_CONGESTION' ? 42 : 21); return moFailure(res, cause, fcs, detail); };
+  const bad = (status, body) => { moRejected(MO_RP_CAUSE[body.diameterResultCode] || 38); return reply(res, 'smsf', what, status, body); };
+  const fail = (cause, fcs, detail) => { moRejected(MO_SM_FAILURE_RP_CAUSE[cause] || 21); return moFailure(res, cause, fcs, detail); };
 
   let sc = null;
   if (scenarioName) {
@@ -530,11 +535,24 @@ async function attemptMt(m) {
 }
 
 // Which RP message came back in the MT-Forward answer (TS 24.011 7.3): counted per PDU, RP-ERROR also per cause.
-function countMtAnswer(m, fwd) {
-  const hex = fwd.body && fwd.body.deliveryReport && fwd.body.deliveryReport.hex;
+// The UE's answer in an MT-Forward reply. SGd TFA carries the bare SMS-DELIVER-REPORT TPDU (TS 29.338 SM-RP-UI) and
+// the SMSF gives the RP-Cause in body.rpCause; an RP-ACK/RP-ERROR with its RP header is accepted too.
+function ueAnswer(fwd) {
+  const b = fwd.body || {};
+  const hex = b.deliveryReport && b.deliveryReport.hex;
+  const given = Number.isInteger(b.rpCause) ? b.rpCause : null;
   const mti = hex && /^[0-9a-f]{2}/i.test(hex) ? parseInt(hex.slice(0, 2), 16) & 7 : -1;
-  if (mti === 2 || mti === 3) return pdu('in', m.kind === 'STATUS_REPORT' ? 'RP-ACK/STATUS-REPORT-ACK' : 'RP-ACK/SMS-DELIVER-REPORT');
-  if (mti === 4 || mti === 5) { pdu('in', 'RP-ERROR/SMS-DELIVER-REPORT'); return rpCause('in', tpdu.rpErrorCause(hex)); }
+  if (mti === 4 || mti === 5) return { kind: 'ERROR', cause: given !== null ? given : tpdu.rpErrorCause(hex), hex };
+  if (given !== null) return { kind: 'ERROR', cause: given, hex };
+  if (mti === 2 || mti === 3) return { kind: 'ACK', hex };
+  if (hex) return fwd.status === 200 ? { kind: 'ACK', hex } : fwd.status === 502 ? { kind: 'ERROR', cause: null, hex } : { kind: null, hex };
+  return { kind: null, hex: null };
+}
+
+function countMtAnswer(m, fwd) {
+  const a = ueAnswer(fwd);
+  if (a.kind === 'ACK') return pdu('in', m.kind === 'STATUS_REPORT' ? 'RP-ACK/STATUS-REPORT-ACK' : 'RP-ACK/SMS-DELIVER-REPORT');
+  if (a.kind === 'ERROR') { pdu('in', 'RP-ERROR/SMS-DELIVER-REPORT'); return rpCause('in', a.cause); }
   return pdu('in', 'none/no-report');
 }
 
@@ -603,9 +621,10 @@ async function attemptMtOnce(m, a) {
     await reportDeliveryStatus(m, 'ABSENT_SUBSCRIBER');
     return waitForAlert(m, 'absent subscriber at the SMSF, reported to the UDM for MWD');
   }
-  // Only this attempt's delivery report counts; m.deliveryReportHex may hold one from an earlier attempt.
-  const drHex = fwd.body && fwd.body.deliveryReport && fwd.body.deliveryReport.hex;
-  const rpCause = drHex ? tpdu.rpErrorCause(drHex) : null;
+  // Only this attempt's answer counts; m.deliveryReportHex may hold one from an earlier attempt.
+  const ans = ueAnswer(fwd);
+  const drHex = ans.kind === 'ERROR' ? (ans.hex || '-') : null;
+  const rpCause = ans.kind === 'ERROR' ? ans.cause : null;
   if (rpCause === 22) { // RP-Cause 22: memory capacity exceeded (TS 24.011 8.2.5.4)
     await reportDeliveryStatus(m, 'MEMORY_CAPACITY_EXCEEDED');
     return waitForAlert(m, 'UE memory full, reported to the UDM for MWD');

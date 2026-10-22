@@ -98,6 +98,11 @@ status report for an MO with TP-SRR (`kind: "STATUS_REPORT"`, `reportFor` = the 
 4. `POST {udm}/sms-routing/v1/report-sm-delivery-status` with `{ msisdn, scAddress, deliveryOutcome }`:
    `ABSENT_SUBSCRIBER` (the UDM sets MWD), `MEMORY_CAPACITY_EXCEEDED`, or `SUCCESSFUL_TRANSFER` after a stored SM.
 
+How we read the SMSF's answer: SGd carries the bare TPDU (SM-RP-UI), so `deliveryReport.hex` is normally a bare
+SMS-DELIVER-REPORT (e.g. `0000`) and the RP-Cause of an RP-ERROR comes in `rpCause` (integer) in the body. 200 means
+RP-ACK, 502 with a `rpCause` or a `deliveryReport` means RP-ERROR. A `deliveryReport.hex` that starts with an RP header
+(RP-ACK/RP-ERROR, MTI 2-5) is accepted too; then the cause is read from it if `rpCause` is missing.
+
 | Outcome | Our action | Status |
 | --- | --- | --- |
 | SMSF 200 | delivered | `DELIVERED` |
@@ -105,7 +110,7 @@ status report for an MO with TP-SRR (`kind: "STATUS_REPORT"`, `reportFor` = the 
 | SMSF RP-ERROR cause 22 | report `MEMORY_CAPACITY_EXCEEDED`, wait for the alert | `WAITING` |
 | SMSF 502 RP-ERROR temporary cause 41, 42, 47 or 111 (TS 24.011 8.2.5.4) | retry with backoff 30 s x 2^n, max 10 min | `WAITING` |
 | SRI 404 `UNKNOWN_SUBSCRIBER`, 403 `CALL_BARRED` / `TELESERVICE_NOT_PROVISIONED`, any other RP-ERROR cause (e.g. 21, 95-99) | stop, reason in `failure` | `FAILED` |
-| UDM/SMSF 5xx (incl. 502 without a deliveryReport), timeout, SMSF not in NRF | retry with backoff 30 s x 2^n, max 10 min | `WAITING` |
+| UDM/SMSF 5xx (incl. 502 without `rpCause` and without a deliveryReport), timeout, SMSF not in NRF | retry with backoff 30 s x 2^n, max 10 min | `WAITING` |
 | backoff retries reach 8 attempts in total | stop, reason in `failure` | `FAILED` |
 | validity period passed (`validitySeconds` on `/api/mt`, default 24 h) | stop, never sent | `EXPIRED` |
 
@@ -178,8 +183,9 @@ Every key below exists from the start with value 0 (no key appears only after it
   `pdus.in` by the RP message in `deliveryReport`: RP-ACK (`SMS-DELIVER-REPORT` for an SMS, `STATUS-REPORT-ACK` for a
   status report), RP-ERROR (any cause), or `none/no-report` when there is no deliveryReport (or no answer).
 - `rpCauses.in`: the cause in a UE RP-ERROR. `rpCauses.out`: the RP-Cause the SMSF should give the UE for our MO
-  rejection: 5555 `SC_CONGESTION` gives 42, any other 5555 gives 21, 5004 gives 95, 5005 gives 96, 5552 gives 69, and
-  5012 gives 38.
+  rejection, per TS 23.040 11.3: 5555 `UNKNOWN_SERVICE_CENTRE` gives 1, `SC_CONGESTION` 42, `INVALID_SME_ADDRESS` 21,
+  `USER_NOT_SC_USER` 28, `EQUIPMENT_PROTOCOL_ERROR` 21 (no row in 11.3); 5552 facility not supported gives 69; 5004 and
+  5005 (unexpected data value) and 5012 (system failure) give 38.
 - `statusReports`:
   - `generated`: records made for TP-SRR.
   - `sent`: MT-Forward attempts that carry one.
