@@ -15,7 +15,7 @@ const SELF_BASE = `${HOST}/t/${TEAM}`;
 const NF_TYPE = 'CUSTOM_SMSC';
 const NF_ID = '6f1c2c1e-0000-4000-8000-0000686f6c6d'; // stable across restarts, so the NRF sees one SMSC
 const SC_ADDRESS = '46700000100';
-const NRF_REFRESH_MS = 5 * 60 * 1000;
+const HEARTBEAT_S = 30;
 const LOG_MAX = 500;
 const STORE_MAX = 500;
 
@@ -65,8 +65,8 @@ async function readJson(req) {
   return t ? JSON.parse(t) : {};
 }
 
-async function call(peer, method, url, body) {
-  rec('out', peer, `${method} ${url}`, null, body);
+async function call(peer, method, url, body, { quiet = false } = {}) {
+  if (!quiet) rec('out', peer, `${method} ${url}`, null, body);
   try {
     const r = await fetch(url, {
       method,
@@ -77,7 +77,7 @@ async function call(peer, method, url, body) {
     const text = await r.text();
     let json = null;
     try { json = text ? JSON.parse(text) : null; } catch { json = text; }
-    rec('in', peer, `${method} ${url}`, r.status, json);
+    if (!quiet || r.status >= 300) rec('in', peer, `${method} ${url}`, r.status, json);
     return { status: r.status, body: json };
   } catch (e) {
     rec('in', peer, `${method} ${url}`, 0, e.message);
@@ -90,12 +90,15 @@ function nfProfile() {
     nfInstanceId: NF_ID,
     nfType: NF_TYPE,
     nfStatus: 'REGISTERED',
+    fqdn: new URL(HOST).hostname,
+    heartBeatTimer: HEARTBEAT_S,
     plmnList: [{ mcc: '001', mnc: '01' }],
     customInfo: { scAddress: SC_ADDRESS },
     nfServices: [{
       serviceInstanceId: 'nsmsc-sgd-1', serviceName: 'nsmsc-sgd',
       versions: [{ apiVersionInUri: 'v1', apiFullVersion: '1.0.0' }],
-      scheme: 'https', nfServiceStatus: 'REGISTERED', apiPrefix: SELF_BASE,
+      scheme: new URL(HOST).protocol.replace(':', ''), nfServiceStatus: 'REGISTERED',
+      apiPrefix: `/t/${TEAM}`, apiRoot: SELF_BASE,
     }],
   };
 }
@@ -104,6 +107,24 @@ async function registerInNrf() {
   const r = await call('nrf', 'PUT', `${NRF_NFM}/nf-instances/${NF_ID}`, nfProfile());
   st.registered = r.status === 200 || r.status === 201;
   return st.registered;
+}
+
+// TS 29.510 heartbeat; the NRF suspends us after 3 missed ones. A 404 means it lost us: register again.
+async function heartbeat() {
+  if (!st.registered) return registerInNrf();
+  const r = await call('nrf', 'PATCH', `${NRF_NFM}/nf-instances/${NF_ID}`, [], { quiet: true });
+  if (r.status === 404) return registerInNrf();
+  if (r.status === 0 || r.status >= 300) st.registered = false;
+}
+
+// The NRF adds apiRoot to discovery results; peers may also publish an absolute or a relative apiPrefix.
+function baseOf(inst) {
+  const svc = (inst.nfServices || [])[0] || {};
+  if (svc.apiRoot) return svc.apiRoot.replace(/\/$/, '');
+  const prefix = svc.apiPrefix || inst.apiPrefix || '';
+  if (/^https?:\/\//.test(prefix)) return prefix.replace(/\/$/, '');
+  if (prefix.startsWith('/')) return `${HOST}${prefix}`.replace(/\/$/, '');
+  return null;
 }
 
 // Base URL of an NF through NRF discovery, cached 60 s.
@@ -117,8 +138,7 @@ async function resolve(nfType, instanceId) {
   const list = r.body && Array.isArray(r.body.nfInstances) ? r.body.nfInstances : [];
   const inst = (instanceId && list.find(i => i.nfInstanceId === instanceId)) || list[0];
   if (!inst) return null;
-  const svc = (inst.nfServices || [])[0] || {};
-  const base = (svc.apiPrefix || inst.apiPrefix || '').replace(/\/$/, '') || null;
+  const base = baseOf(inst);
   if (base) st.disc.set(key, { base, ts: Date.now() });
   return base;
 }
@@ -169,19 +189,13 @@ module.exports = {
   init(ctx) {
     st.dataDir = ctx && ctx.dataDir;
     loadStore();
-    // The NRF may load after us, and it may lose its state on a redeploy: retry until registered,
-    // then refresh the registration now and then.
-    let lastOk = 0;
-    const tick = async () => {
-      if (st.registered && Date.now() - lastOk < NRF_REFRESH_MS) return;
-      if (await registerInNrf()) lastOk = Date.now();
-    };
-    const first = setTimeout(() => { tick().catch(e => console.error(`[${TEAM}] nrf:`, e.message)); }, 3000);
+    // The NRF may load after us or lose its state on a redeploy: heartbeat() re-registers when needed.
+    const first = setTimeout(() => { heartbeat().catch(e => console.error(`[${TEAM}] nrf:`, e.message)); }, 3000);
     if (first.unref) first.unref();
-    every(10000, tick);
+    every(HEARTBEAT_S * 1000, heartbeat);
   },
   handle,
   // For tests.
   _st: st,
-  _internals: { nfProfile, resolve, registerInNrf, saveStore, SC_ADDRESS, NF_ID, NF_TYPE },
+  _internals: { nfProfile, resolve, registerInNrf, heartbeat, baseOf, saveStore, SC_ADDRESS, NF_ID, NF_TYPE },
 };

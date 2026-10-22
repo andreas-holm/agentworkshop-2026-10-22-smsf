@@ -10,7 +10,7 @@ TS 29.338 (SGd, S6c) and TS 29.002 (MAP). No TLS/OAuth2.
 
 ## Base URL and discovery
 
-- API root: `https://smsf.torget.bjarby.com/t/holminator` (the `apiPrefix` in our NRF profile).
+- API root: `https://smsf.torget.bjarby.com/t/holminator` (`apiRoot` in our NRF profile; `apiPrefix` is `/t/holminator`).
 - Do not hardcode it: discover us through the NRF (smsf-hao) with `target-nf-type=CUSTOM_SMSC`.
   TS 29.510 has no SMSC type, so we use the CUSTOM_ prefix.
 - SC address (the SMSC's E.164, `scAddress` in all messages): `46700000100`.
@@ -109,13 +109,18 @@ Tile: `https://smsf.torget.bjarby.com/colony/holminator/`.
   "nfInstanceId": "6f1c2c1e-0000-4000-8000-0000686f6c6d",
   "nfType": "CUSTOM_SMSC",
   "nfStatus": "REGISTERED",
+  "fqdn": "smsf.torget.bjarby.com",
+  "heartBeatTimer": 30,
   "plmnList": [{ "mcc": "001", "mnc": "01" }],
   "customInfo": { "scAddress": "46700000100" },
   "nfServices": [{
     "serviceInstanceId": "nsmsc-sgd-1", "serviceName": "nsmsc-sgd",
     "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
     "scheme": "https", "nfServiceStatus": "REGISTERED",
-    "apiPrefix": "https://smsf.torget.bjarby.com/t/holminator"
+    "apiPrefix": "/t/holminator",
+    "apiRoot": "https://smsf.torget.bjarby.com/t/holminator"
   }]
 }
 ```
+
+We heartbeat the NRF every 30 s (PATCH with `[]`) and register again if it answers 404.

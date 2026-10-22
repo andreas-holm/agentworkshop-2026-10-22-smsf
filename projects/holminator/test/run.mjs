@@ -45,10 +45,12 @@ await t('decodeMo rejects garbage', () => {
 
 // ---------- plugin over HTTP, with a fake NRF ----------
 const nrfCalls = [];
+let fakeStatus = 201;
 const fake = http.createServer(async (req, res) => {
   let body = ''; for await (const c of req) body += c;
   nrfCalls.push({ method: req.method, url: req.url, body: body ? JSON.parse(body) : null });
-  res.writeHead(201, { 'content-type': 'application/json' }); res.end(body || '{}');
+  const status = req.method === 'PATCH' && fakeStatus === 201 ? 204 : req.method === 'PATCH' ? fakeStatus : 201;
+  res.writeHead(status, { 'content-type': 'application/json' }); res.end(status === 204 ? '' : body || '{}');
 });
 await new Promise(r => fake.listen(0, r));
 const fakeBase = `http://127.0.0.1:${fake.address().port}`;
@@ -78,7 +80,26 @@ await t('registers in the NRF as CUSTOM_SMSC with apiPrefix', async () => {
   assert.ok(put, 'no PUT to NRF');
   assert.equal(put.url, `/t/nrf/nnrf-nfm/v1/nf-instances/${plugin._internals.NF_ID}`);
   assert.equal(put.body.nfType, 'CUSTOM_SMSC');
-  assert.equal(put.body.nfServices[0].apiPrefix, `${fakeBase}/t/holminator`);
+  assert.equal(put.body.nfServices[0].apiPrefix, '/t/holminator');
+  assert.equal(put.body.nfServices[0].apiRoot, `${fakeBase}/t/holminator`);
+  assert.equal(put.body.fqdn, '127.0.0.1');
+  assert.equal(put.body.heartBeatTimer, 30);
+});
+await t('heartbeat PATCHes [] and re-registers on 404', async () => {
+  nrfCalls.length = 0;
+  await plugin._internals.heartbeat();
+  assert.equal(nrfCalls[0].method, 'PATCH'); assert.deepEqual(nrfCalls[0].body, []);
+  nrfCalls.length = 0; fakeStatus = 404;
+  await plugin._internals.heartbeat();
+  fakeStatus = 201;
+  assert.deepEqual(nrfCalls.map(c => c.method), ['PATCH', 'PUT']);
+});
+await t('baseOf prefers apiRoot, then absolute, then relative apiPrefix', () => {
+  const b = plugin._internals.baseOf;
+  assert.equal(b({ nfServices: [{ apiRoot: 'https://a/t/x/', apiPrefix: '/t/y' }] }), 'https://a/t/x');
+  assert.equal(b({ nfServices: [{ apiPrefix: 'https://h/t/krilju' }] }), 'https://h/t/krilju');
+  assert.equal(b({ nfServices: [{ apiPrefix: '/t/udm' }] }), `${fakeBase}/t/udm`);
+  assert.equal(b({ nfServices: [{}] }), null);
 });
 await t('GET /status reports registration', async () => {
   const r = await j('GET', '/status');
